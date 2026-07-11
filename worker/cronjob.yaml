@@ -1,0 +1,40 @@
+# Interim CronJob: runs on stock BCI python with pip at start (proper image
+# build via Harbor is T-009 follow-up). Script mounted from ConfigMap.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lab-memory-ingest
+  namespace: lab-memory
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 840
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: ingest
+              image: registry.suse.com/bci/python:3.12
+              command: ["/bin/sh", "-c"]
+              args:
+                - pip install --quiet pymilvus requests && python3 /app/ingest.py
+              env:
+                - name: KARAKEEP_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: lab-memory-ingest
+                      key: karakeep-api-key
+              volumeMounts:
+                - name: app
+                  mountPath: /app
+              resources:
+                requests: {memory: 256Mi, cpu: 100m}
+                limits: {memory: 1Gi, cpu: "1"}
+          volumes:
+            - name: app
+              configMap:
+                name: lab-memory-ingest-script
