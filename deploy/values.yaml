@@ -22,6 +22,7 @@ controllers:
           INFERENCE_ENABLE_AUTO_SUMMARIZATION: "true"
           OLLAMA_KEEP_ALIVE: "30m"
           DB_WAL_MODE: "true"
+          DISABLE_SIGNUPS: "true"   # first user created 2026-07-11; lock signups
           LOG_LEVEL: "info"
         resources:
           requests:
