@@ -14,6 +14,7 @@ matching the GitHub board names:
 - `ash4d-site`
 - `edge`
 - `lab-memory`
+- `gear` (music equipment: pedal manuals, amp docs, gear reference)
 - `misc` (unscoped saves)
 
 **Layer 2 (OPTIONAL):** freeform tags for recall. AI auto-tags from Ollama ride
