@@ -1,0 +1,58 @@
+# lab-memory: Karakeep values override (chart: karakeep-app/karakeep v0.32.0)
+# Drafted by qwen3-coder:30b (local Ollama), reviewed by Claude. T-001/T-002/T-003.
+# applicationSecretKey and meilisearchMasterKey are injected at install time
+# via --set from deploy/secrets.env (git-ignored) -- see install.sh. Pinning them
+# prevents the chart's randAlphaNum defaults from rotating on every upgrade.
+
+applicationProtocol: http
+applicationHost: karakeep.ash4d.com
+
+controllers:
+  karakeep:
+    containers:
+      karakeep:
+        env:
+          # --- Ollama inference (T-002): all AI local, zero external calls ---
+          OLLAMA_BASE_URL: "http://192.168.7.153:11434"
+          INFERENCE_TEXT_MODEL: "llama3.1"
+          INFERENCE_IMAGE_MODEL: "gemma4:12b"   # multimodal, confirmed 2026-07-11
+          INFERENCE_CONTEXT_LENGTH: "8192"
+          INFERENCE_JOB_TIMEOUT_SEC: "120"
+          INFERENCE_FETCH_TIMEOUT_SEC: "600"
+          INFERENCE_ENABLE_AUTO_SUMMARIZATION: "true"
+          OLLAMA_KEEP_ALIVE: "30m"
+          DB_WAL_MODE: "true"
+          LOG_LEVEL: "info"
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 250m
+          limits:
+            memory: 2Gi
+            cpu: 1000m
+    statefulset:
+      # Full restatement: helm lists replace, they do not merge.
+      volumeClaimTemplates:
+        - name: data
+          accessMode: ReadWriteOnce
+          size: 5Gi
+          storageClass: longhorn
+          globalMounts:
+            - path: /data
+
+ingress:
+  karakeep:
+    enabled: true
+    className: traefik
+    hosts:
+      - host: "{{ .Values.applicationHost }}"
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              identifier: karakeep
+              port: http
+
+meilisearch:
+  persistence:
+    storageClass: longhorn
