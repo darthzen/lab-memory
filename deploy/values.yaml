@@ -4,7 +4,7 @@
 # via --set from deploy/secrets.env (git-ignored) -- see install.sh. Pinning them
 # prevents the chart's randAlphaNum defaults from rotating on every upgrade.
 
-applicationProtocol: http
+applicationProtocol: https
 applicationHost: karakeep.ash4d.com
 
 controllers:
@@ -53,6 +53,10 @@ ingress:
             service:
               identifier: karakeep
               port: http
+    tls:
+      - hosts:
+          - "{{ .Values.applicationHost }}"
+        secretName: karakeep-ash4d-tls   # cert-manager, letsencrypt-dns (DNS-01)
 
 meilisearch:
   persistence:
