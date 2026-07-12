@@ -4,6 +4,9 @@ Mirrors every Karakeep bookmark with usable text into the `lab_memory`
 Milvus collection (chunked, embedded via Ollama/snowflake-arctic-embed2).
 Safe to run repeatedly; derives all state by diffing the two systems.
 Documents are embedded RAW; recall side must prepend QUERY_PREFIX.
+
+Citation URLs are built from PUBLIC_ADDR (what a human can click), never
+from the in-cluster service address used for API calls.
 """
 
 import os
@@ -15,6 +18,7 @@ import requests
 from pymilvus import DataType, MilvusClient
 
 KARAKEEP_API_ADDR = os.environ.get("KARAKEEP_API_ADDR", "http://karakeep.lab-memory.svc.cluster.local:3000")
+PUBLIC_ADDR = os.environ.get("PUBLIC_ADDR", "https://karakeep.ash4d.com").rstrip("/")
 KARAKEEP_API_KEY = os.environ.get("KARAKEEP_API_KEY", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama.ai.svc.cluster.local:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "snowflake-arctic-embed2")
@@ -23,7 +27,9 @@ COLLECTION = os.environ.get("COLLECTION", "lab_memory")
 CHUNK_CHARS = int(os.environ.get("CHUNK_CHARS", "3200"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "200"))
 EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "16"))
+MIN_TEXT_CHARS = int(os.environ.get("MIN_TEXT_CHARS", "40"))
 QUERY_PREFIX = "query: "  # arctic-embed2 asymmetry: queries get this prefix, documents do not
+VECTOR_DIM = 1024
 
 PAGE_MARK = re.compile(r"-{10,}Page \(?\d+\)? ?Break-{10,}")
 TAG_RE = re.compile(r"<[^>]+>")
@@ -43,25 +49,27 @@ def fetch_karakeep() -> dict:
         params = {"limit": 50, "includeContent": "true"}
         if cursor:
             params["cursor"] = cursor
-        r = sess.get(f"{KARAKEEP_API_ADDR}/api/v1/bookmarks", params=params, timeout=30)
+        r = sess.get(f"{KARAKEEP_API_ADDR}/api/v1/bookmarks", params=params, timeout=60)
         r.raise_for_status()
         data = r.json()
         for bm in data.get("bookmarks", []):
             content = bm.get("content") or {}
             ctype = content.get("type")
+            preview_url = f"{PUBLIC_ADDR}/dashboard/preview/{bm['id']}"
             if ctype == "link":
                 text = TAG_RE.sub(" ", content.get("htmlContent") or "") or (content.get("description") or "")
-                url = content.get("url") or ""
+                url = content.get("url") or preview_url
             elif ctype == "text":
                 text = content.get("text") or ""
-                url = f"{KARAKEEP_API_ADDR}/dashboard/preview/{bm['id']}"
+                url = preview_url
             elif ctype == "asset":
                 text = content.get("content") or ""
-                url = f"{KARAKEEP_API_ADDR}/dashboard/preview/{bm['id']}"
+                url = preview_url
             else:
                 continue
             text = text.strip()
-            if len(text) < 40:
+            if len(text) < MIN_TEXT_CHARS:
+                print(f"SKIP {bm['id']} (text too short: {len(text)} chars)")
                 continue
             out[bm["id"]] = {
                 "modified_at": bm.get("modifiedAt") or bm.get("createdAt") or "",
@@ -69,6 +77,7 @@ def fetch_karakeep() -> dict:
                 "tags": [t["name"] for t in bm.get("tags", [])],
                 "text": text,
                 "url": url[:1000],
+                "preview_url": preview_url,
             }
         cursor = data.get("nextCursor")
         if not cursor:
@@ -76,6 +85,10 @@ def fetch_karakeep() -> dict:
 
 
 def chunk_text(text: str) -> list:
+    """Split on page-break markers or paragraph breaks near the window tail.
+
+    Always makes forward progress; every returned chunk is non-empty.
+    """
     chunks = []
     start = 0
     n = len(text)
@@ -85,11 +98,11 @@ def chunk_text(text: str) -> list:
         if end < n:
             tail_from = int(len(window) * 0.8)
             cut = -1
-            m = None
-            for m in PAGE_MARK.finditer(window, tail_from):
+            last = None
+            for last in PAGE_MARK.finditer(window, tail_from):
                 pass
-            if m:
-                cut = m.start()
+            if last is not None:
+                cut = last.start()
             else:
                 cut = window.rfind("\n\n", tail_from)
             if cut > 0:
@@ -105,6 +118,7 @@ def chunk_text(text: str) -> list:
 
 
 def embed(texts: list) -> list:
+    """Embed in batches. Guarantees one vector per input, in order."""
     vectors = []
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i : i + EMBED_BATCH]
@@ -113,16 +127,27 @@ def embed(texts: list) -> list:
                 r = requests.post(
                     f"{OLLAMA_URL}/api/embed",
                     json={"model": EMBED_MODEL, "input": batch},
-                    timeout=120,
+                    timeout=180,
                 )
                 r.raise_for_status()
-                vectors.extend(r.json()["embeddings"])
+                payload = r.json()
+                got = payload.get("embeddings")
+                if not isinstance(got, list) or len(got) != len(batch):
+                    raise ValueError(
+                        f"malformed embed response: expected {len(batch)} vectors, "
+                        f"got {len(got) if isinstance(got, list) else type(got).__name__}"
+                    )
+                if any(len(v) != VECTOR_DIM for v in got):
+                    raise ValueError(f"unexpected vector dim (want {VECTOR_DIM}) from model {EMBED_MODEL}")
+                vectors.extend(got)
                 break
             except Exception as exc:  # noqa: BLE001
                 if attempt == 2:
                     raise
                 print(f"WARN: embed batch retry {attempt + 1}: {exc}")
                 time.sleep(5 * (attempt + 1))
+    if len(vectors) != len(texts):
+        raise RuntimeError(f"vector/chunk misalignment: {len(vectors)} vectors for {len(texts)} chunks")
     return vectors
 
 
@@ -133,28 +158,41 @@ def ensure_collection(client: MilvusClient) -> None:
     schema.add_field("pk", DataType.INT64, is_primary=True)
     schema.add_field("karakeep_id", DataType.VARCHAR, max_length=32)
     schema.add_field("chunk_ix", DataType.INT64)
-    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=1024)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
     schema.add_field("title", DataType.VARCHAR, max_length=512)
     schema.add_field("url", DataType.VARCHAR, max_length=1024)
+    schema.add_field("preview_url", DataType.VARCHAR, max_length=1024)
     schema.add_field("tags", DataType.VARCHAR, max_length=1024)
     schema.add_field("modified_at", DataType.VARCHAR, max_length=64)
-    schema.add_field("preview", DataType.VARCHAR, max_length=1024)
+    schema.add_field("preview", DataType.VARCHAR, max_length=2048)
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="vector", index_type="AUTOINDEX", metric_type="COSINE")
     client.create_collection(COLLECTION, schema=schema, index_params=index_params)
-    print(f"CREATED collection {COLLECTION}")
+    print(f"CREATED collection {COLLECTION} (dim={VECTOR_DIM}, COSINE)")
 
 
 def milvus_state(client: MilvusClient) -> dict:
+    """Every karakeep_id already in Milvus -> its embedded modified_at.
+
+    Paginated: Milvus caps a single query at 16384 rows and the corpus will
+    outgrow that; iterating keeps the reconcile honest at any size.
+    """
     state = {}
-    rows = client.query(
+    it = client.query_iterator(
         collection_name=COLLECTION,
         filter="pk >= 0",
         output_fields=["karakeep_id", "modified_at"],
-        limit=16384,
+        batch_size=1000,
     )
-    for row in rows:
-        state[row["karakeep_id"]] = row["modified_at"]
+    try:
+        while True:
+            rows = it.next()
+            if not rows:
+                break
+            for row in rows:
+                state[row["karakeep_id"]] = row["modified_at"]
+    finally:
+        it.close()
     return state
 
 
@@ -176,7 +214,12 @@ def main() -> None:
         item = karakeep[kid]
         try:
             chunks = chunk_text(item["text"])
+            if not chunks:
+                print(f"SKIP {kid} (no chunks after splitting)")
+                continue
             vectors = embed(chunks)
+            # Delete-then-insert: a crash between the two leaves the doc absent
+            # rather than duplicated, and the next run re-upserts it.
             client.delete(collection_name=COLLECTION, filter=f'karakeep_id == "{kid}"')
             rows = [
                 {
@@ -185,9 +228,10 @@ def main() -> None:
                     "vector": vec,
                     "title": item["title"],
                     "url": item["url"],
+                    "preview_url": item["preview_url"],
                     "tags": ",".join(item["tags"])[:1000],
                     "modified_at": item["modified_at"],
-                    "preview": chunk[:1000],
+                    "preview": chunk[:2000],
                 }
                 for ix, (chunk, vec) in enumerate(zip(chunks, vectors))
             ]
@@ -201,6 +245,7 @@ def main() -> None:
         client.delete(collection_name=COLLECTION, filter=f'karakeep_id == "{kid}"')
         print(f"DELETE {kid}")
 
+    client.flush(COLLECTION)
     print(f"SUMMARY upserted={len(to_upsert) - failures} deleted={len(to_delete)} failures={failures}")
     sys.exit(1 if failures else 0)
 

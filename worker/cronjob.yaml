@@ -23,6 +23,10 @@ spec:
               args:
                 - pip install --quiet pymilvus requests && python3 /app/ingest.py
               env:
+                # Human-clickable base for citations (in-cluster svc addr is used
+                # for API calls only). Flip to https after the TLS ingress lands.
+                - name: PUBLIC_ADDR
+                  value: http://karakeep.ash4d.com
                 - name: KARAKEEP_API_KEY
                   valueFrom:
                     secretKeyRef:

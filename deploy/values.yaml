@@ -21,6 +21,11 @@ controllers:
           INFERENCE_FETCH_TIMEOUT_SEC: "600"
           INFERENCE_ENABLE_AUTO_SUMMARIZATION: "true"
           OLLAMA_KEEP_ALIVE: "30m"
+          # LLM-based OCR (gemma4:12b) instead of tesseract: image-only PDFs
+          # (Seabee, Black Fountain, Macrodose, Dark Light) extracted ~2K chars
+          # under tesseract. Docs: OCR_USE_LLM falls back to tesseract if no
+          # inference provider is set. Verified against Karakeep docs v0.32.0.
+          OCR_USE_LLM: "true"
           DB_WAL_MODE: "true"
           DISABLE_SIGNUPS: "true"   # first user created 2026-07-11; lock signups
           LOG_LEVEL: "info"
