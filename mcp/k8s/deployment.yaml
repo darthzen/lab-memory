@@ -40,7 +40,7 @@ spec:
             - name: MCP_PORT
               value: "8765"
             - name: PUBLIC_ADDR
-              value: http://karakeep.ash4d.com
+              value: https://karakeep.ash4d.com
             - name: KARAKEEP_API_KEY
               valueFrom:
                 secretKeyRef:

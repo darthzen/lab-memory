@@ -18,7 +18,7 @@ MILVUS_URI = os.environ.get("MILVUS_URI", "http://milvus.ai.svc.cluster.local:19
 COLLECTION = os.environ.get("COLLECTION", "lab_memory")
 KARAKEEP_API_ADDR = os.environ.get("KARAKEEP_API_ADDR", "http://karakeep.lab-memory.svc.cluster.local:3000")
 KARAKEEP_API_KEY = os.environ.get("KARAKEEP_API_KEY", "")
-PUBLIC_ADDR = os.environ.get("PUBLIC_ADDR", "http://karakeep.ash4d.com").rstrip("/")
+PUBLIC_ADDR = os.environ.get("PUBLIC_ADDR", "https://karakeep.ash4d.com").rstrip("/")
 QUERY_PREFIX = "query: "
 
 _client = None
@@ -104,7 +104,9 @@ def recall(query: str, k: int = 5, tag: str = "", expand: bool = False, per_doc:
             Hit(
                 title=e["title"],
                 snippet=e["preview"],
-                citation=e.get("preview_url") or f"{PUBLIC_ADDR}/dashboard/preview/{kid}",
+                # built at query time, never read from the stored field: changing
+                # PUBLIC_ADDR (e.g. http -> https) must not require re-embedding the corpus
+                citation=f"{PUBLIC_ADDR}/dashboard/preview/{kid}",
                 source_url=e["url"],
                 tags=e["tags"],
                 score=round(float(match["distance"]), 4),
