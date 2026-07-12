@@ -35,6 +35,14 @@ PAGE_MARK = re.compile(r"-{10,}Page \(?\d+\)? ?Break-{10,}")
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+def clip(s: str, max_bytes: int) -> str:
+    """Milvus VARCHAR max_length counts BYTES. Truncate on a UTF-8 boundary."""
+    b = s.encode("utf-8")
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", "ignore")
+
+
 def die(msg: str) -> None:
     print(f"FATAL: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -72,12 +80,12 @@ def fetch_karakeep() -> dict:
                 print(f"SKIP {bm['id']} (text too short: {len(text)} chars)")
                 continue
             out[bm["id"]] = {
-                "modified_at": bm.get("modifiedAt") or bm.get("createdAt") or "",
-                "title": (bm.get("title") or content.get("fileName") or bm["id"])[:500],
+                "modified_at": clip(bm.get("modifiedAt") or bm.get("createdAt") or "", 64),
+                "title": clip(bm.get("title") or content.get("fileName") or bm["id"], 500),
                 "tags": [t["name"] for t in bm.get("tags", [])],
                 "text": text,
-                "url": url[:1000],
-                "preview_url": preview_url,
+                "url": clip(url, 1000),
+                "preview_url": clip(preview_url, 1000),
             }
         cursor = data.get("nextCursor")
         if not cursor:
@@ -229,9 +237,9 @@ def main() -> None:
                     "title": item["title"],
                     "url": item["url"],
                     "preview_url": item["preview_url"],
-                    "tags": ",".join(item["tags"])[:1000],
+                    "tags": clip(",".join(item["tags"]), 1000),
                     "modified_at": item["modified_at"],
-                    "preview": chunk[:2000],
+                    "preview": clip(chunk, 2000),
                 }
                 for ix, (chunk, vec) in enumerate(zip(chunks, vectors))
             ]
