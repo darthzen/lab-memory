@@ -1,0 +1,1 @@
+If I want to create a subject matter expert memory similar to what we've done with lab-memory, would it be best to create a separate mcp server and data?
