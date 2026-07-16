@@ -16,6 +16,11 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "snowflake-arctic-embed2")
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "llama3.1")
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://milvus.ai.svc.cluster.local:19530")
 COLLECTION = os.environ.get("COLLECTION", "lab_memory")
+# Relevance floor: drop hits whose COSINE score is below this. On arctic-embed2
+# (compressed score range) live data shows noise topping out ~0.20 while weakest
+# genuine paraphrase matches land ~0.26, so 0.25 cuts junk without losing real
+# hits. Tunable per reader via env; 0 disables the floor.
+MIN_SCORE = float(os.environ.get("RECALL_MIN_SCORE", "0.25"))
 # When set, this reader is scoped to a Karakeep list: recall widens to the list's
 # ancestor chain ({self + parents}) so a child SME list inherits its parents'
 # knowledge. Empty = a plain collection reader (e.g. lab_memory), no list filter.
@@ -151,6 +156,10 @@ def recall(query: str, k: int = 5, tag: str = "", expand: bool = False, per_doc:
     hits = []
     seen = {}
     for match in res[0]:
+        # Milvus returns matches sorted by COSINE score descending, so the first
+        # sub-floor hit means every remaining one is too -> stop.
+        if float(match["distance"]) < MIN_SCORE:
+            break
         e = match["entity"]
         kid = e["karakeep_id"]
         if seen.get(kid, 0) >= per_doc:
