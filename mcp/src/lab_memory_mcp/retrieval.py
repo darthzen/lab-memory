@@ -16,12 +16,17 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "snowflake-arctic-embed2")
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "llama3.1")
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://milvus.ai.svc.cluster.local:19530")
 COLLECTION = os.environ.get("COLLECTION", "lab_memory")
+# When set, this reader is scoped to a Karakeep list: recall widens to the list's
+# ancestor chain ({self + parents}) so a child SME list inherits its parents'
+# knowledge. Empty = a plain collection reader (e.g. lab_memory), no list filter.
+LIST_ID = os.environ.get("LIST_ID", "").strip()
 KARAKEEP_API_ADDR = os.environ.get("KARAKEEP_API_ADDR", "http://karakeep.lab-memory.svc.cluster.local:3000")
 KARAKEEP_API_KEY = os.environ.get("KARAKEEP_API_KEY", "")
 PUBLIC_ADDR = os.environ.get("PUBLIC_ADDR", "https://karakeep.ash4d.com").rstrip("/")
 QUERY_PREFIX = "query: "
 
 _client = None
+_parent_cache = None  # {list_id: parentId}, fetched once per process
 
 
 def milvus() -> MilvusClient:
@@ -79,11 +84,62 @@ def embed_query(text: str) -> list:
     return vectors[0]
 
 
+def _parent_map() -> dict:
+    """{list_id: parentId} for every Karakeep list, fetched once and cached.
+
+    Karakeep list membership does not propagate to parents, so parent docs live
+    only under their own list_id; inheritance is done here at query time.
+    """
+    global _parent_cache
+    if _parent_cache is None:
+        headers = {"Authorization": f"Bearer {KARAKEEP_API_KEY}"}
+        parents, cursor = {}, None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(f"{KARAKEEP_API_ADDR}/api/v1/lists", params=params, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            for L in data.get("lists", []):
+                parents[L["id"]] = L.get("parentId")
+            cursor = data.get("nextCursor")
+            if not cursor:
+                break
+        _parent_cache = parents
+    return _parent_cache
+
+
+def ancestor_chain(list_id: str) -> list:
+    """[list_id, parent, grandparent, ...] -- the scope a child inherits from."""
+    chain, seen, cur = [], set(), list_id
+    parents = _parent_map()
+    while cur and cur not in seen:
+        chain.append(cur)
+        seen.add(cur)
+        cur = parents.get(cur)
+    return chain
+
+
+def _scope_filter() -> str:
+    """Milvus filter restricting recall to this reader's list + its ancestors."""
+    if not LIST_ID:
+        return ""
+    ids = ancestor_chain(LIST_ID)
+    quoted = ", ".join(f'"{i}"' for i in ids)
+    return f"list_id in [{quoted}]"
+
+
 def recall(query: str, k: int = 5, tag: str = "", expand: bool = False, per_doc: int = 2) -> list:
-    """Semantic search over the shelf. `tag` filters on Karakeep tags (substring match)."""
+    """Semantic search over the shelf. `tag` filters on Karakeep tags (substring match).
+
+    A list-scoped reader (LIST_ID set) also restricts results to its list plus all
+    ancestor lists, so a child inherits parent knowledge without any data copy.
+    """
     text = expand_query(query) if expand else query
     vector = embed_query(text)
-    flt = f'tags like "%{tag}%"' if tag else ""
+    clauses = [c for c in (_scope_filter(), f'tags like "%{tag}%"' if tag else "") if c]
+    flt = " and ".join(clauses)
     res = milvus().search(
         collection_name=COLLECTION,
         data=[vector],
@@ -143,8 +199,21 @@ def save(tags: list, url: str = "", text: str = "", title: str = "") -> dict:
         timeout=60,
     )
     tr.raise_for_status()
+
+    # A list-scoped reader files the note into its own list so the ingest worker
+    # routes it to this SME collection instead of lab_memory. List membership is
+    # deterministic (no async tagger in the loop), so routing is decided at save.
+    if LIST_ID:
+        lr = requests.put(
+            f"{KARAKEEP_API_ADDR}/api/v1/lists/{LIST_ID}/bookmarks/{bid}",
+            headers=headers,
+            timeout=60,
+        )
+        lr.raise_for_status()
+
     return {
         "id": bid,
         "tags": wanted,
+        "list_id": LIST_ID,
         "citation": f"{PUBLIC_ADDR}/dashboard/preview/{bid}",
     }

@@ -1,7 +1,16 @@
 """lab-memory ingest worker: stateless Karakeep -> Milvus reconcile.
 
-Mirrors every Karakeep bookmark with usable text into the `lab_memory`
+Default: mirrors every Karakeep bookmark with usable text into the `lab_memory`
 Milvus collection (chunked, embedded via Ollama/snowflake-arctic-embed2).
+
+SME routing (SME_ROUTES): bookmarks that live under a configured Karakeep list
+subtree are routed OUT of `lab_memory` and INTO a per-domain SME collection,
+stamped with the `list_id` of the deepest routed list they belong to. Recall on
+the SME side widens a query to {self + ancestors}, so a child list inherits its
+parents' knowledge without the data ever being copied. One fetch snapshot drives
+every collection in a single pass, so `lab_memory` and the SME collections never
+transiently hold the same document (no comingling, no inter-job race).
+
 Safe to run repeatedly; derives all state by diffing the two systems.
 Documents are embedded RAW; recall side must prepend QUERY_PREFIX.
 
@@ -23,7 +32,11 @@ KARAKEEP_API_KEY = os.environ.get("KARAKEEP_API_KEY", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama.ai.svc.cluster.local:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "snowflake-arctic-embed2")
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://milvus.ai.svc.cluster.local:19530")
-COLLECTION = os.environ.get("COLLECTION", "lab_memory")
+DEFAULT_COLLECTION = os.environ.get("COLLECTION", "lab_memory")
+# SME routing map: "rootListId:collection,rootListId2:collection2". Every list at
+# or below a root routes its bookmarks into that root's collection. Empty = the
+# worker behaves exactly as before (everything -> DEFAULT_COLLECTION).
+SME_ROUTES = os.environ.get("SME_ROUTES", "")
 CHUNK_CHARS = int(os.environ.get("CHUNK_CHARS", "3200"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "200"))
 EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "16"))
@@ -48,11 +61,15 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def fetch_karakeep() -> dict:
+def session() -> requests.Session:
+    s = requests.Session()
+    s.headers["Authorization"] = f"Bearer {KARAKEEP_API_KEY}"
+    return s
+
+
+def fetch_karakeep(sess: requests.Session) -> dict:
     out = {}
     cursor = None
-    sess = requests.Session()
-    sess.headers["Authorization"] = f"Bearer {KARAKEEP_API_KEY}"
     while True:
         params = {"limit": 50, "includeContent": "true"}
         if cursor:
@@ -91,6 +108,115 @@ def fetch_karakeep() -> dict:
         if not cursor:
             return out
 
+
+# --------------------------------------------------------------------------- #
+# SME list routing
+# --------------------------------------------------------------------------- #
+
+def parse_routes(spec: str) -> dict:
+    """"rootListId:collection,..." -> {rootListId: collection}."""
+    routes = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        rid, _, coll = part.partition(":")
+        rid, coll = rid.strip(), coll.strip()
+        if not rid or not coll:
+            die(f"malformed SME_ROUTES entry {part!r} (want rootListId:collection)")
+        routes[rid] = coll
+    return routes
+
+
+def fetch_lists(sess: requests.Session) -> dict:
+    """All Karakeep lists -> {id: {'name':..., 'parentId':...}}. One or few calls."""
+    lists = {}
+    cursor = None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        r = sess.get(f"{KARAKEEP_API_ADDR}/api/v1/lists", params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        for L in data.get("lists", []):
+            lists[L["id"]] = {"name": L.get("name"), "parentId": L.get("parentId")}
+        cursor = data.get("nextCursor")
+        if not cursor:
+            return lists
+
+
+def fetch_list_members(sess: requests.Session, list_id: str) -> set:
+    """Explicit bookmark ids in a list. Membership does NOT propagate to parents,
+    so each list is enumerated on its own (verified against Karakeep v1)."""
+    ids = set()
+    cursor = None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        r = sess.get(f"{KARAKEEP_API_ADDR}/api/v1/lists/{list_id}/bookmarks", params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        for bm in data.get("bookmarks", []):
+            ids.add(bm["id"])
+        cursor = data.get("nextCursor")
+        if not cursor:
+            return ids
+
+
+def _children(lists: dict) -> dict:
+    kids = {}
+    for lid, meta in lists.items():
+        p = meta.get("parentId")
+        if p:
+            kids.setdefault(p, []).append(lid)
+    return kids
+
+
+def _subtree(root: str, kids: dict) -> list:
+    out, stack = [], [root]
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(kids.get(n, []))
+    return out
+
+
+def _depth(lid: str, lists: dict) -> int:
+    d, cur = 0, lists.get(lid, {}).get("parentId")
+    while cur:
+        d += 1
+        cur = lists.get(cur, {}).get("parentId")
+    return d
+
+
+def resolve_routing(sess: requests.Session, routes: dict, lists: dict) -> dict:
+    """bookmark_id -> (collection, list_id) for everything under a routed subtree.
+
+    A bookmark filed in several routed lists is stamped with the DEEPEST one, so a
+    doc placed in both a parent and a child is owned by the child. Raises on any
+    error: a partial resolution could let an SME doc fall through to lab_memory,
+    so routing is all-or-nothing to guarantee no comingling.
+    """
+    kids = _children(lists)
+    # bookmark_id -> (collection, list_id, depth)
+    best = {}
+    for root, coll in routes.items():
+        if root not in lists:
+            die(f"SME_ROUTES root {root} not found in Karakeep lists")
+        for lid in _subtree(root, kids):
+            depth = _depth(lid, lists)
+            for bid in fetch_list_members(sess, lid):
+                prev = best.get(bid)
+                if prev is None or depth > prev[2]:
+                    best[bid] = (coll, lid, depth)
+    return {bid: (c, l) for bid, (c, l, _d) in best.items()}
+
+
+# --------------------------------------------------------------------------- #
+# Chunk / embed
+# --------------------------------------------------------------------------- #
 
 def chunk_text(text: str) -> list:
     """Split on page-break markers or paragraph breaks near the window tail.
@@ -159,8 +285,12 @@ def embed(texts: list) -> list:
     return vectors
 
 
-def ensure_collection(client: MilvusClient) -> None:
-    if client.has_collection(COLLECTION):
+# --------------------------------------------------------------------------- #
+# Milvus
+# --------------------------------------------------------------------------- #
+
+def ensure_collection(client: MilvusClient, collection: str, with_list_id: bool) -> None:
+    if client.has_collection(collection):
         return
     schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
     schema.add_field("pk", DataType.INT64, is_primary=True)
@@ -173,21 +303,24 @@ def ensure_collection(client: MilvusClient) -> None:
     schema.add_field("tags", DataType.VARCHAR, max_length=1024)
     schema.add_field("modified_at", DataType.VARCHAR, max_length=64)
     schema.add_field("preview", DataType.VARCHAR, max_length=2048)
+    if with_list_id:
+        # owning Karakeep list; recall filters `list_id IN {self + ancestors}`
+        schema.add_field("list_id", DataType.VARCHAR, max_length=32)
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="vector", index_type="AUTOINDEX", metric_type="COSINE")
-    client.create_collection(COLLECTION, schema=schema, index_params=index_params)
-    print(f"CREATED collection {COLLECTION} (dim={VECTOR_DIM}, COSINE)")
+    client.create_collection(collection, schema=schema, index_params=index_params)
+    print(f"CREATED collection {collection} (dim={VECTOR_DIM}, COSINE, list_id={with_list_id})")
 
 
-def milvus_state(client: MilvusClient) -> dict:
-    """Every karakeep_id already in Milvus -> its embedded modified_at.
+def milvus_state(client: MilvusClient, collection: str) -> dict:
+    """Every karakeep_id already in `collection` -> its embedded modified_at.
 
     Paginated: Milvus caps a single query at 16384 rows and the corpus will
     outgrow that; iterating keeps the reconcile honest at any size.
     """
     state = {}
     it = client.query_iterator(
-        collection_name=COLLECTION,
+        collection_name=collection,
         filter="pk >= 0",
         output_fields=["karakeep_id", "modified_at"],
         batch_size=1000,
@@ -204,22 +337,28 @@ def milvus_state(client: MilvusClient) -> dict:
     return state
 
 
-def main() -> None:
-    if not KARAKEEP_API_KEY:
-        die("KARAKEEP_API_KEY not set")
-    client = MilvusClient(uri=MILVUS_URI)
-    ensure_collection(client)
-    client.load_collection(COLLECTION)
+def reconcile(client: MilvusClient, collection: str, subset: dict, list_ids: dict) -> int:
+    """Bring `collection` in line with `subset` (its slice of the fetch snapshot).
 
-    karakeep = fetch_karakeep()
-    existing = milvus_state(client)
-    to_upsert = [k for k, v in karakeep.items() if existing.get(k) != v["modified_at"]]
-    to_delete = [k for k in existing if k not in karakeep]
-    print(f"RECONCILE karakeep={len(karakeep)} milvus_docs={len(existing)} upsert={len(to_upsert)} delete={len(to_delete)}")
+    `subset` is the set of bookmarks that belong in THIS collection; anything in
+    the collection but absent from `subset` is deleted -- which is exactly how a
+    bookmark newly filed into an SME list migrates out of lab_memory on the same
+    run it lands in the SME collection. `list_ids` (bookmark_id -> list_id) is
+    stamped only when the collection carries the field.
+    """
+    with_list_id = collection != DEFAULT_COLLECTION
+    ensure_collection(client, collection, with_list_id)
+    client.load_collection(collection)
+
+    existing = milvus_state(client, collection)
+    to_upsert = [k for k, v in subset.items() if existing.get(k) != v["modified_at"]]
+    to_delete = [k for k in existing if k not in subset]
+    print(f"RECONCILE[{collection}] karakeep={len(subset)} milvus_docs={len(existing)} "
+          f"upsert={len(to_upsert)} delete={len(to_delete)}")
 
     failures = 0
     for kid in to_upsert:
-        item = karakeep[kid]
+        item = subset[kid]
         try:
             chunks = chunk_text(item["text"])
             if not chunks:
@@ -228,9 +367,10 @@ def main() -> None:
             vectors = embed(chunks)
             # Delete-then-insert: a crash between the two leaves the doc absent
             # rather than duplicated, and the next run re-upserts it.
-            client.delete(collection_name=COLLECTION, filter=f'karakeep_id == "{kid}"')
-            rows = [
-                {
+            client.delete(collection_name=collection, filter=f'karakeep_id == "{kid}"')
+            rows = []
+            for ix, (chunk, vec) in enumerate(zip(chunks, vectors)):
+                row = {
                     "karakeep_id": kid,
                     "chunk_ix": ix,
                     "vector": vec,
@@ -241,20 +381,66 @@ def main() -> None:
                     "modified_at": item["modified_at"],
                     "preview": clip(chunk, 2000),
                 }
-                for ix, (chunk, vec) in enumerate(zip(chunks, vectors))
-            ]
-            client.insert(collection_name=COLLECTION, data=rows)
-            print(f"UPSERT {kid} \"{item['title'][:60]}\" chunks={len(rows)}")
+                if with_list_id:
+                    row["list_id"] = list_ids.get(kid, "")
+                rows.append(row)
+            client.insert(collection_name=collection, data=rows)
+            print(f"UPSERT[{collection}] {kid} \"{item['title'][:60]}\" chunks={len(rows)}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
-            print(f"ERROR upserting {kid}: {exc}", file=sys.stderr)
+            print(f"ERROR upserting {kid} -> {collection}: {exc}", file=sys.stderr)
 
     for kid in to_delete:
-        client.delete(collection_name=COLLECTION, filter=f'karakeep_id == "{kid}"')
-        print(f"DELETE {kid}")
+        client.delete(collection_name=collection, filter=f'karakeep_id == "{kid}"')
+        print(f"DELETE[{collection}] {kid}")
 
-    client.flush(COLLECTION)
-    print(f"SUMMARY upserted={len(to_upsert) - failures} deleted={len(to_delete)} failures={failures}")
+    client.flush(collection)
+    print(f"SUMMARY[{collection}] upserted={len(to_upsert) - failures} "
+          f"deleted={len(to_delete)} failures={failures}")
+    return failures
+
+
+def main() -> None:
+    if not KARAKEEP_API_KEY:
+        die("KARAKEEP_API_KEY not set")
+    sess = session()
+    client = MilvusClient(uri=MILVUS_URI)
+
+    karakeep = fetch_karakeep(sess)
+
+    # Resolve list routing over the SAME snapshot. All-or-nothing: a failure here
+    # aborts before any write, so an unresolved SME doc can never leak into
+    # lab_memory.
+    routes = parse_routes(SME_ROUTES)
+    routing = {}
+    if routes:
+        lists = fetch_lists(sess)
+        routing = resolve_routing(sess, routes, lists)
+        print(f"ROUTING roots={list(routes.items())} routed_bookmarks={len(routing)}")
+
+    # Partition the snapshot: routed bookmarks go to their SME collection, the
+    # rest to DEFAULT_COLLECTION. Because partitions are disjoint, no document is
+    # ever a member of two collections' subsets -> no comingling. Every configured
+    # SME collection is seeded empty so it (and its readers) exist even before the
+    # first bookmark is filed into that domain.
+    partitions = {DEFAULT_COLLECTION: {}}
+    for coll in routes.values():
+        partitions.setdefault(coll, {})
+    list_ids = {}
+    for kid, item in karakeep.items():
+        target = routing.get(kid)
+        if target:
+            coll, lid = target
+            partitions.setdefault(coll, {})[kid] = item
+            list_ids[kid] = lid
+        else:
+            partitions[DEFAULT_COLLECTION][kid] = item
+
+    failures = 0
+    for collection, subset in partitions.items():
+        failures += reconcile(client, collection, subset, list_ids)
+
+    print(f"DONE collections={len(partitions)} total_failures={failures}")
     sys.exit(1 if failures else 0)
 
 

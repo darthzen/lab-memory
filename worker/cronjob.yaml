@@ -27,6 +27,12 @@ spec:
                 # for API calls only). Flip to https after the TLS ingress lands.
                 - name: PUBLIC_ADDR
                   value: https://karakeep.ash4d.com
+                # SME routing: bookmarks under the `salesengineer` list subtree are
+                # routed out of lab_memory into sme_salesengineer, stamped list_id.
+                # Format: rootListId:collection[,rootListId2:collection2]. One writer
+                # reconciles every collection from a single fetch snapshot.
+                - name: SME_ROUTES
+                  value: "ipnsyy1t55vakjtzkn25y1p0:sme_salesengineer"
                 - name: KARAKEEP_API_KEY
                   valueFrom:
                     secretKeyRef:

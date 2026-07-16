@@ -24,6 +24,9 @@ def recall(query: str, k: int = 5, tag: str = "", expand: bool = False) -> dict:
     Returns passages with a Karakeep citation URL for each. Use `tag` to scope to a
     project (`lab-memory`, `nemoclaw`, `lab-fleet`, `ash4d-site`, `edge`, `gear`,
     `misc`), and `expand` to widen a terse query with llama3.1 before embedding.
+
+    If this reader is list-scoped (an SME domain), results are already restricted to
+    its Karakeep list plus every ancestor list, so a child inherits parent knowledge.
     """
     hits = retrieval.recall(query=query, k=k, tag=tag, expand=expand)
     return {
@@ -60,13 +63,16 @@ def memory_status() -> dict:
     """Health of the memory stack: collection size and reachable backends."""
     client = retrieval.milvus()
     stats = client.get_collection_stats(retrieval.COLLECTION)
-    return {
+    status = {
         "collection": retrieval.COLLECTION,
         "chunks": stats.get("row_count"),
         "embed_model": retrieval.EMBED_MODEL,
         "milvus": retrieval.MILVUS_URI,
         "karakeep": retrieval.PUBLIC_ADDR,
     }
+    if retrieval.LIST_ID:
+        status["list_scope"] = retrieval.ancestor_chain(retrieval.LIST_ID)
+    return status
 
 
 def main() -> None:
