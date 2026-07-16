@@ -46,6 +46,37 @@
   "session_metrics": {
     "turn_count": 1
   },
+  "summary": {
+    "intent": "Get entire.io checkpoint data (18 checkpoints in the lab-memory repo) to sync correctly with the remote dashboard, since it appeared enabled and working locally but showed nothing remotely.",
+    "outcome": "Root cause fully diagnosed: the 18 checkpoints were created via `entire import claude-code`, a read-only import that writes git refs (which mirror fine) but never registers sessions with the 'cell' (the dashboard's actual datastore) — so they can never appear on the dashboard by design. User chose to reconstruct the historical session as a live one; assistant used `entire session attach` to create a real (non-read-only) checkpoint from the original Cowork transcript, then discovered the cell only ingests checkpoints anchored to a pushed commit, and was mid-way through creating a non-destructive anchor commit with an `Entire-Checkpoint` trailer when the transcript ends (not yet verified as ingested).",
+    "learnings": {
+      "repo": [
+        "entire.io has two checkpoint backends: 'branch' (writes to entire/checkpoints/v1, pushes normally) and 'refs' (writes to refs/entire/checkpoints/*, a custom namespace git does not push by default); this repo's .entire/settings.json is configured as type: git-refs",
+        "The dashboard does NOT render by walking the git mirror's refs/entire/* namespace — it renders exclusively from the 'cell' (aws-us-east-2.api.entire.io), queried via recap?repo= and me/activity endpoints",
+        "`entire import claude-code` imports transcripts as 'local, read-only history' by design: creates git refs (Entire-Strategy: import, no commit-link trailer, 'commits (none on this branch)') but never registers with the cell — no --publish/--push flag exists to change this",
+        "`entire session attach <session-id>` is the supported recovery path for sessions where hooks didn't fire: it creates a real checkpoint linked to HEAD (not read-only, has an author, supports `entire explain --generate`), but it only attaches to HEAD, not arbitrary historical commits",
+        "Even a real attached checkpoint isn't ingested by the cell just from pushing its git ref to the mirror — the cell only ingests checkpoints anchored to a pushed commit via an `Entire-Checkpoint: <id>` trailer in the commit message",
+        "Cowork/local-agent-mode session transcripts live under non-standard `output-*` cwds, not under the standard `~/.claude/projects/-Users-rashford-Developer-lab-memory/` location that `entire session attach` looks in by session-id — they must be staged into the standard location first"
+      ],
+      "code": [],
+      "workflow": [
+        "When diagnosing a multi-hop sync pipeline, verify each layer independently (auth → CLI enable/hooks → local git refs → remote git mirror → backend datastore) rather than assuming a broken link at the first plausible layer",
+        "'Proof by contrast' — comparing a known-working case (heartbeat repo, live-tracked, cell shows real data) against the broken case (lab-memory, imported, cell shows 0/0/0) — isolated the true variable (import vs. live-tracked) faster than inspecting lab-memory alone",
+        "Prefer additive/reversible fixes (a new anchor commit with a trailer) over rewriting or force-pushing already-published commit history, even when a tool's docs hint at commit amending as an option"
+      ]
+    },
+    "friction": [
+      "Session started with an expired login prompt requiring /login before proceeding",
+      "No direct cell upload/sync command exists in the entire CLI; had to reverse-engineer the ingestion path via hooks/pre-push uploader inspection",
+      "Pushing the new checkpoint's git ref to the mirror did not trigger cell ingestion as expected, costing an extra diagnostic round trip before realizing ingestion requires a commit-anchored trailer",
+      "attach's transcript lookup only works for the standard project directory, so Cowork transcripts required manual staging before attach could find them"
+    ],
+    "open_items": [
+      "Confirm the anchor commit (with Entire-Checkpoint trailer) actually flips the cell recap for lab-memory from checkpoints:0 to non-zero once pushed",
+      "Retire/clean up the original 18 read-only import refs to avoid duplication now that a real attached checkpoint exists",
+      "No per-commit reconstruction was needed since all 18 imports mapped to a single session (d9667159), but this was only confirmed after investigation — worth remembering attach is HEAD-only if a future case spans multiple commits"
+    ]
+  },
   "prompt_attributions": [
     {
       "checkpoint_number": 1,
